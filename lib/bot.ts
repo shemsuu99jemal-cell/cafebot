@@ -104,7 +104,7 @@ export async function handleUpdate(u: any) {
     cb = u.callback_query,
     from = (msg ?? cb)?.from,
     chat = (msg?.chat ?? cb?.message?.chat)?.id;
-  if (!from || !chat || (msg && !msg.text)) return;
+  if (!from || !chat || (msg && !msg.text && !msg.photo)) return;
   const ins = await db
     .from("telegram_updates")
     .insert({ update_id: u.update_id });
@@ -115,6 +115,7 @@ export async function handleUpdate(u: any) {
   if (cb) await answer(cb.id);
   const tg: number = from.id,
     text: string | undefined = msg?.text?.trim(),
+    photo: string | undefined = msg?.photo?.at(-1)?.file_id,
     data: string | undefined = cb?.data;
   let lang: Lang = "en";
   try {
@@ -179,7 +180,7 @@ export async function handleUpdate(u: any) {
       canClose: cafe.receptionist_can_close,
       lang,
     };
-    await dispatch(m, tg, chat, u.update_id, text, data, st);
+    await dispatch(m, tg, chat, u.update_id, text, data, photo, st);
   } catch (e) {
     console.error("bot error", e);
     await send(chat, t(lang, "error")).catch(() => {});
@@ -356,6 +357,7 @@ async function dispatch(
   uid: number,
   text: string | undefined,
   data: string | undefined,
+  photo: string | undefined,
   st: St,
 ) {
   let act: string | null = null;
@@ -379,6 +381,20 @@ async function dispatch(
     return action(m, tg, chat, act);
   }
   if (data) return callback(m, tg, chat, uid, data, st);
+  if (photo && st?.state === "ITEM_PROOF") {
+    const d: Record<string, any> = { ...st.data, proofFileId: photo };
+    await setState(tg, "ITEM_CONFIRM", d);
+    return send(
+      chat,
+      `${t(m.lang, "itemConfirm")}\n\n${d.itemName} × ${d.quantity}\n${t(m.lang, "amount")}: ${etb(BigInt(d.quantity) * BigInt(d.unitPrice))}\n${t(m.lang, "payment")}: ${d.pmName}`,
+      inline([
+        [
+          [t(m.lang, "record"), "item:submit"],
+          [t(m.lang, "cancel"), "cancel"],
+        ],
+      ]),
+    );
+  }
   if (text && st) return onText(m, tg, chat, uid, text, st);
   return action(m, tg, chat, "menu");
 }
@@ -481,6 +497,40 @@ async function callback(
   switch (k) {
     case "rep":
       return report(m, chat, v);
+    case "sale_pm": {
+      if (s !== "ITEM_PAY") return;
+      const type = v === "BANK" ? "CBE" : v;
+      if (!["CASH", "CBE", "TELEBIRR"].includes(type)) return;
+      const { data: p } = await db
+        .from("payment_methods")
+        .select("id,name,type")
+        .eq("cafe_id", m.cafeId)
+        .eq("type", type)
+        .eq("active", true)
+        .maybeSingle();
+      if (!p) return send(chat, t(l, "badPm"));
+      const payment = {
+        ...d,
+        pm: p.id,
+        pmName: v === "BANK" ? "🏦 Bank" : `${ico(p.type)} ${p.name}`,
+        paymentType: v,
+      };
+      if (v !== "CASH") {
+        await setState(tg, "ITEM_PROOF", payment);
+        return send(chat, t(l, "askProof"), cancelKb(l));
+      }
+      await setState(tg, "ITEM_CONFIRM", payment);
+      return send(
+        chat,
+        `${t(l, "itemConfirm")}\n\n${d.itemName} × ${d.quantity}\n${t(l, "amount")}: ${etb(BigInt(d.quantity) * BigInt(d.unitPrice))}\n${t(l, "payment")}: ${payment.pmName}`,
+        inline([
+          [
+            [t(l, "record"), "item:submit"],
+            [t(l, "cancel"), "cancel"],
+          ],
+        ]),
+      );
+    }
     case "pm": {
       if (s !== "PAY" && s !== "ITEM_PAY") return;
       if (v === "other") {
@@ -506,7 +556,7 @@ async function callback(
           `${t(l, "itemConfirm")}\n\n${d.itemName} × ${d.quantity}\n${t(l, "amount")}: ${etb(BigInt(d.quantity) * BigInt(d.unitPrice))}\n${t(l, "payment")}: ${p.name}`,
           inline([
             [
-              [t(l, "yes"), "item:submit"],
+              [t(l, "record"), "item:submit"],
               [t(l, "cancel"), "cancel"],
             ],
           ]),
@@ -763,7 +813,7 @@ async function onText(
       const price = amountOf(text);
       if (price === null) return send(chat, t(l, "badAmt"), cancelKb(l));
       await setState(tg, "ITEM_PAY", { ...d, unitPrice: price.toString() });
-      return askPay(m, chat);
+      return askSalePay(m, chat);
     }
     case "AMOUNT": {
       const a = amountOf(text);
@@ -811,12 +861,27 @@ async function onText(
     case "CASH_ACTUAL": {
       const a = amountOf(text, true);
       if (a === null) return send(chat, t(l, "badAmt"), cancelKb(l));
-      const exp = BigInt(d.expected),
-        diff = calculateCashDifference(exp, a);
       const nd = { ...d, actual: a.toString() };
-      if (diff === 0n) return saveRec(m, tg, chat, nd, "NONE", null);
+      await setState(tg, "DIGITAL_ACTUAL", nd);
+      return send(
+        chat,
+        `${t(l, "actual")}: ${etb(a)}\n\n${t(l, "askDigital")}`,
+        cancelKb(l),
+      );
+    }
+    case "DIGITAL_ACTUAL": {
+      const a = amountOf(text, true);
+      if (a === null) return send(chat, t(l, "badAmt"), cancelKb(l));
+      const exp = BigInt(d.expected),
+        actual = BigInt(d.actual),
+        digitalExpected = BigInt(d.digitalExpected),
+        cashDiff = calculateCashDifference(exp, actual),
+        digitalDiff = calculateCashDifference(digitalExpected, a),
+        nd = { ...d, actualDigital: a.toString() };
+      if (cashDiff === 0n && digitalDiff === 0n)
+        return saveRec(m, tg, chat, nd, "NONE", null);
       await setState(tg, "CASH_REASON", nd);
-      const body = `${t(l, "expected")}:\n${etb(exp)}\n\n${t(l, "actual")}:\n${etb(a)}\n\n${t(l, "diff")}:\n${diff > 0n ? "+" : ""}${etb(diff)}\n\n${t(l, "why")}`;
+      const body = `${t(l, "expected")}:\n${etb(exp)}\n${t(l, "actual")}:\n${etb(actual)}\n${t(l, "diff")}:\n${cashDiff > 0n ? "+" : ""}${etb(cashDiff)}\n\n${t(l, "digitalExpected")}:\n${etb(digitalExpected)}\n${t(l, "digitalActual")}:\n${etb(a)}\n${t(l, "digitalDiff")}:\n${digitalDiff > 0n ? "+" : ""}${etb(digitalDiff)}\n\n${t(l, "why")}`;
       const R = [
         ["EXPENSE_NOT_RECORDED", "r1"],
         ["REFUND", "r2"],
@@ -859,6 +924,19 @@ async function askPay(m: M, chat: number) {
     chat,
     head(t(m.lang, "payT")) + t(m.lang, "askPay"),
     inline(rows),
+  );
+}
+
+async function askSalePay(m: M, chat: number) {
+  return send(
+    chat,
+    head(t(m.lang, "payT")) + t(m.lang, "askSalePay"),
+    inline([
+      [[t(m.lang, "cash"), "sale_pm:CASH"]],
+      [[t(m.lang, "bank"), "sale_pm:BANK"]],
+      [[t(m.lang, "telebirr"), "sale_pm:TELEBIRR"]],
+      [[t(m.lang, "cancel"), "cancel"]],
+    ]),
   );
 }
 
@@ -929,6 +1007,7 @@ async function saveItem(m: M, tg: number, chat: number, uid: number, d: any) {
       type: "INCOME",
       amount: dec(total),
       payment_method_id: d.pm,
+      payment_proof_file_id: d.proofFileId ?? null,
       item_name: d.itemName,
       quantity: d.quantity,
       unit_price: dec(BigInt(d.unitPrice)),
@@ -1084,12 +1163,19 @@ async function showCash(m: M, tg: number, chat: number) {
     today = cafeLocalDate(new Date(), m.tz),
     txs = (await loadTxs(m, today, today)).map(toTx);
   const cash = txs.filter((x) => x.methodType === "CASH"),
-    exp = calculateExpectedCash(txs); // digital payments never count
-  await setState(tg, "CASH_ACTUAL", { expected: exp.toString(), date: today });
+    bank = txs.filter((x) => x.methodType === "CBE"),
+    telebirr = txs.filter((x) => x.methodType === "TELEBIRR"),
+    exp = calculateExpectedCash(txs),
+    digitalExpected = calculateIncome(bank) + calculateIncome(telebirr);
+  await setState(tg, "CASH_ACTUAL", {
+    expected: exp.toString(),
+    digitalExpected: digitalExpected.toString(),
+    date: today,
+  });
   return send(
     chat,
     head(t(l, "cashT")) +
-      `${t(l, "cashIn")}:\n${etb(calculateIncome(cash))}\n\n${t(l, "cashOut")}:\n${etb(calculateExpenses(cash))}\n\n${t(l, "expected")}:\n${etb(exp)}\n\n${t(l, "askActual")}`,
+      `${t(l, "cashIn")}:\n${etb(calculateIncome(cash))}\n\n${t(l, "cashOut")}:\n${etb(calculateExpenses(cash))}\n\n${t(l, "expected")}:\n${etb(exp)}\n\n${t(l, "bankTotal")}:\n${etb(calculateIncome(bank))}\n\n${t(l, "telebirrTotal")}:\n${etb(calculateIncome(telebirr))}\n\n${t(l, "askActual")}`,
     cancelKb(l),
   );
 }
@@ -1121,6 +1207,18 @@ async function saveRec(
       expected_cash: dec(exp),
       actual_cash: dec(act),
       difference: dec(diff),
+      expected_digital: d.digitalExpected
+        ? dec(BigInt(d.digitalExpected))
+        : null,
+      actual_digital: d.actualDigital ? dec(BigInt(d.actualDigital)) : null,
+      digital_difference: d.actualDigital
+        ? dec(
+            calculateCashDifference(
+              BigInt(d.digitalExpected ?? "0"),
+              BigInt(d.actualDigital),
+            ),
+          )
+        : null,
       reason,
       note,
       supersedes_id: prev?.id ?? null, // append-only history
@@ -1131,7 +1229,11 @@ async function saveRec(
   return send(
     chat,
     head(t(l, diff === 0n ? "okT" : "diffT")) +
-      `${t(l, "expected")}: ${etb(exp)}\n${t(l, "actual")}: ${etb(act)}\n${t(l, "diff")}: ${etb(diff)}\n\n${t(l, "saved")}`,
+      `${t(l, "expected")}: ${etb(exp)}\n${t(l, "actual")}: ${etb(act)}\n${t(l, "diff")}: ${etb(diff)}\n` +
+      (d.digitalExpected
+        ? `\n${t(l, "digitalExpected")}: ${etb(BigInt(d.digitalExpected))}\n${t(l, "digitalActual")}: ${etb(BigInt(d.actualDigital ?? "0"))}\n${t(l, "digitalDiff")}: ${etb(calculateCashDifference(BigInt(d.digitalExpected), BigInt(d.actualDigital ?? "0")))}\n`
+        : "") +
+      `\n${t(l, "saved")}`,
     menuKeyboard(l, m.role, m.canClose),
   );
 }

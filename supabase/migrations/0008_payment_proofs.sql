@@ -1,0 +1,1 @@
+alter table transactions add column if not exists payment_proof_file_id text;
